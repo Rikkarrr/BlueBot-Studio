@@ -454,14 +454,18 @@ class BlueBotGUI(ttk.Frame):
         self._write_log(f"[BlueBot] Launching {script} …\n", tags=("bot",))
         self._set_status("running")
 
-        # Start subprocess with stdout piping
+        # Start subprocess with stdout piping (TEXT MODE for line buffering)
         self.stop_reader.clear()
         try:
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                # line-buffered (works only with text=True)
                 bufsize=1,
+                text=True,                 # <— critical fix
+                encoding="utf-8",
+                errors="replace",
                 cwd=os.path.dirname(os.path.abspath(script)) or None,
                 env=env,
             )
@@ -484,17 +488,28 @@ class BlueBotGUI(ttk.Frame):
     def kill_bot(self):
         if self.proc and self.proc.poll() is None:
             self._write_log("[BlueBot] Terminating process …\n", tags=("bot",))
-            self.proc.terminate()
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
             try:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self._write_log("[BlueBot] Force-killing …\n", tags=("bot",))
-                self.proc.kill()
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
         self._cleanup_proc()
         self._set_status("idle")
 
     def _cleanup_proc(self):
         self.stop_reader.set()
+        if self.proc and self.proc.stdout:
+            try:
+                self.proc.stdout.close()
+            except Exception:
+                pass
         self.proc = None
         self.kill_btn.config(state=tk.DISABLED)
         self.run_btn.config(state=tk.DISABLED)
@@ -519,10 +534,11 @@ class BlueBotGUI(ttk.Frame):
     # ---------- Reader / Logs ----------
     def _reader(self, proc: subprocess.Popen):
         try:
-            for raw in iter(proc.stdout.readline, b''):
+            if proc.stdout is None:
+                return
+            for line in proc.stdout:
                 if self.stop_reader.is_set():
                     break
-                line = raw.decode(errors="replace")
                 self.output_q.put(line)
         except Exception as e:
             self.output_q.put(f"[Error] Reader error: {e}\n")
@@ -589,35 +605,42 @@ class BlueBotGUI(ttk.Frame):
     def _set_status(self, state: str):
         self.status_state = state
         if state == "running":
-            self.status_pill.configure(text="• RUNNING")
+            txt = "• RUNNING"
+            fg = self.success
         elif state == "paused":
-            self.status_pill.configure(text="• PAUSED")
+            txt = "• PAUSED"
+            fg = self.warn
         else:
-            self.status_pill.configure(text="• IDLE")
+            txt = "• IDLE"
+            fg = self.col_text
+        try:
+            self.status_pill.configure(text=txt, foreground=fg)
+        except Exception:
+            pass
 
     def _animate_status_pill(self):
-        # Soft pulse glow for the status pill
-        self.pulse_phase = (self.pulse_phase + 1) % 40
-        t = abs(20 - self.pulse_phase) / 20.0  # 0..1..0
-        if self.status_state == "running":
-            base = self.success
-        elif self.status_state == "paused":
-            base = self.warn
-        else:
-            base = self.col_muted
-        glow = self._blend(base, "#FFFFFF", 0.14 * t)
-        self.status_pill.configure(background=glow)
-        self.master.after(60, self._animate_status_pill)
+        # soft pulse while running
+        try:
+            if self.status_state == "running":
+                self.pulse_phase = (self.pulse_phase + 1) % 60
+                t = (self.pulse_phase / 60.0)
+                mix = 0.10 + 0.10 * (1 + (2*t - 1))  # simple wave
+                self.status_pill.configure(background=self._blend(
+                    "#1b2231", self.accent, abs(mix)))
+            else:
+                self.status_pill.configure(background="#1b2231")
+        except Exception:
+            pass
+        self.master.after(120, self._animate_status_pill)
 
-    # ---------- Settings persistence ----------
     def _apply_accent(self):
-        value = self.accent_var.get().strip()
-        if not value.startswith("#") or len(value) not in (4, 7):
+        color = self.accent_var.get().strip() or self.accent
+        if not color.startswith("#") or len(color) not in (4, 7):
             messagebox.showerror(
-                "Accent Color", "Please enter a valid hex color like #7C5CFF.")
+                "Invalid color", "Please enter a hex color like #7C5CFF")
             return
-        self.accent = value
-        self.prefs["accent_color"] = value
+        self.accent = color
+        self.prefs["accent_color"] = color
         save_prefs(self.prefs)
         self._init_theme()
         self._paint_header_gradient(self.header_canvas)
@@ -658,9 +681,16 @@ class BlueBotGUI(ttk.Frame):
                 self.proc.terminate()
             except Exception:
                 pass
-        self.stop_reader.set()
+            try:
+                self.proc.wait(timeout=1.5)
+            except Exception:
+                pass
+        self._cleanup_proc()
         save_prefs(self.prefs)
-        self.master.destroy()
+        try:
+            self.master.destroy()
+        except Exception:
+            pass
 
 
 def main():
@@ -669,7 +699,14 @@ def main():
     root.configure(bg="#0f1116")
     root.geometry("980x640")
     app = BlueBotGUI(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        # Graceful Ctrl+C in console
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
